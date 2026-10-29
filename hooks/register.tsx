@@ -9,14 +9,17 @@ import type {
   SessionRecord,
 } from '../types'
 
-const PANE = 'session-status-all'
-const PANE_TITLE = 'Сессии'
+// One pane for the session's own project, another for every project.
+const PANE = 'session-status-project'
+const PANE_ALL = 'session-status-all'
 const HEARTBEAT_MS = 15_000
 const GIT_POLL_MS = 60_000
 // A record whose session has not written for this long is shown as closed.
 const STALE_MS = 3 * HEARTBEAT_MS
-// Records older than this are not shown in the pane at all.
+// Records older than this are not read at all.
 const KEEP_MS = 3 * 24 * 60 * 60 * 1000
+// A closed session stays listed this long after its last write.
+const CLOSED_KEEP_MS = 60 * 60 * 1000
 
 // Change a tag when its value's fields change: an older stored value is dropped.
 const self = atom({ plugin: 'session-status', key: 'self' } as const, null, {
@@ -51,11 +54,24 @@ const me = {
   cwd: '',
   isGitBusy: false,
   isGitDirty: false,
+  // The mark this process last put in front of the chat's title in the app.
+  mark: '',
+  // The person turned the marks off.
+  isTitleOff: false,
+  // No app tools here: a terminal session.
+  isAppless: false,
 }
 const agentSteps = new Map<string, Step>()
 // Tool calls whose permission prompt is open, by tool_use_id.
 const asking = new Set<string>()
 let publishing: Promise<void> = Promise.resolve()
+
+// The desktop app's own tools: the chat list shows the session's title, and
+// these are the only way into that list.
+const INFO_TOOL = 'mcp__ccd_session_mgmt__get_session'
+const TITLE_TOOL = 'mcp__ccd_session_mgmt__set_session_title'
+const MARK = /^[●◐✓✗◷○] /
+const MARKS_OFF_KEY = 'title-marks-off'
 const bins = new Map<string, string>()
 
 function prettyModel(id: string): string {
@@ -278,8 +294,84 @@ async function readAll($: EngineInterface, now: number): Promise<SessionRecord[]
 
 // Publishes run one at a time, so an older snapshot never lands after a newer one.
 function publish($: EngineInterface): Promise<void> {
-  publishing = publishing.then(() => writeRecord($)).catch(() => undefined)
+  publishing = publishing
+    .then(() => writeRecord($))
+    .then(() => syncTitle($))
+    .catch(() => undefined)
   return publishing
+}
+
+// Whether the app's tool runs without asking the person; a session with no
+// such tool (a terminal) stops asking for the rest of its life.
+async function isAllowed($: EngineInterface, tool: string): Promise<boolean> {
+  if (me.isAppless) return false
+  const verdict = await $.tool
+    .check({ tool, input: { session_id: 'self', title: 'x' } })
+    .catch(() => null)
+  if (verdict === null) {
+    me.isAppless = true
+    return false
+  }
+  return 'decision' in verdict && verdict.decision === 'allow'
+}
+
+// The app's own view of the session: its title in the chat list and the
+// model and effort picked there, which an idle session has not sent yet.
+async function readApp(
+  $: EngineInterface,
+): Promise<{ title: string; model: string; effort: string } | null> {
+  if (!(await isAllowed($, INFO_TOOL))) return null
+  const info = await $.tool.call({ tool: INFO_TOOL, session_id: 'self' }).catch(() => null)
+  if (info === null || info.deny !== undefined || info.isError === true) return null
+  let found: { title?: unknown; model?: unknown; effort?: unknown }
+  try {
+    found = JSON.parse(info.text ?? '{}') as typeof found
+  } catch {
+    return null
+  }
+  const app = {
+    title: typeof found.title === 'string' ? found.title : '',
+    model: typeof found.model === 'string' ? found.model : '',
+    effort: typeof found.effort === 'string' ? found.effort : '',
+  }
+  const base = app.title.replace(MARK, '').trim()
+  if (base !== '') me.title = base.slice(0, 80)
+  // While a turn runs, its own steps say what the model really got.
+  if (me.activity !== 'working') {
+    if (app.model !== '') me.model = app.model
+    if (app.effort !== '') me.effort = app.effort
+  }
+  return app
+}
+
+function markOf(): string {
+  if (me.activity === 'working') return '●'
+  if (me.activity === 'waiting') return '◐'
+  if (me.git?.ci === 'success') return '✓'
+  if (me.git?.ci === 'failure') return '✗'
+  if (me.git?.ci === 'pending') return '◷'
+  return '○'
+}
+
+// Puts the status mark in front of the chat's title in the app's chat list,
+// keeping whatever title the app or the person gave it. Runs only when the
+// mark changes, and only where renaming asks nobody: the person is never
+// prompted for it.
+async function syncTitle($: EngineInterface): Promise<void> {
+  const mark = me.isTitleOff ? '' : markOf()
+  if (mark === me.mark || me.id === '') return
+  if (!(await isAllowed($, TITLE_TOOL))) return
+  const title = (await readApp($))?.title ?? ''
+  const base = title.replace(MARK, '')
+  // Before the app has named the chat there is nothing to keep.
+  if (base.trim() === '') return
+  const next = mark === '' ? base : `${mark} ${base}`
+  if (next !== title) {
+    const set = await $.tool.call({ tool: TITLE_TOOL, session_id: 'self', title: next })
+      .catch(() => null)
+    if (set === null || set.deny !== undefined || set.isError === true) return
+  }
+  me.mark = mark
 }
 
 async function writeRecord($: EngineInterface): Promise<void> {
@@ -307,6 +399,7 @@ async function writeRecord($: EngineInterface): Promise<void> {
 
 async function refreshAll($: EngineInterface): Promise<void> {
   await refreshGit($).catch(() => undefined)
+  await readApp($).catch(() => undefined)
   await publish($)
 }
 
@@ -322,8 +415,14 @@ async function followId($: EngineInterface): Promise<void> {
   asking.clear()
 }
 
-function openPane($: EngineInterface) {
-  return $.ui.open({ id: PANE, title: PANE_TITLE })
+function keyOf(record: SessionRecord): string {
+  return record.git?.repo ?? record.cwd
+}
+
+function openPane($: EngineInterface, isAll = false) {
+  if (isAll) return $.ui.open({ id: PANE_ALL, title: 'Все проекты' })
+  const name = (me.git?.repo ?? me.cwd).split('/').pop() ?? ''
+  return $.ui.open({ id: PANE, title: `Проект ${name}` })
 }
 
 export const register: Register = on => {
@@ -341,12 +440,21 @@ export const register: Register = on => {
 
     await $.command.register({
       name: 'sessions',
-      description: 'Панель всех сессий: статус, агенты, модель, CI на GitHub',
+      description: 'Сессии этого проекта: статус, агенты, модель, CI на GitHub',
+    })
+    await $.command.register({
+      name: 'sessions-all',
+      description: 'Сессии всех проектов: статус, агенты, модель, CI на GitHub',
     })
     await $.command.register({
       name: 'session-band',
       description: 'Показать или скрыть строку статуса над полем ввода',
     })
+    await $.command.register({
+      name: 'session-title-mark',
+      description: 'Включить или выключить значок статуса в названии чата',
+    })
+    me.isTitleOff = (await $.store.get(MARKS_OFF_KEY).catch(() => undefined)) === true
 
     $.clock.every(HEARTBEAT_MS, () => fire(publish($)))
     $.clock.every(GIT_POLL_MS, () => fire(refreshAll($)))
@@ -359,7 +467,8 @@ export const register: Register = on => {
     me.activity = 'ended'
     me.since = await $.clock.now()
     asking.clear()
-    await publish($)
+    // The record alone: the app's tools may be gone while the session ends.
+    await writeRecord($).catch(() => undefined)
     return next(e)
   })
 
@@ -426,7 +535,27 @@ export const register: Register = on => {
   on('command.run', { command: 'sessions' }, async $ => {
     await openPane($)
     fire(refreshAll($))
-    return { text: 'Панель «Сессии» открыта.' }
+    return { text: 'Панель сессий этого проекта открыта.' }
+  })
+
+  on('command.run', { command: 'sessions-all' }, async $ => {
+    await openPane($, true)
+    fire(refreshAll($))
+    return { text: 'Панель сессий всех проектов открыта.' }
+  })
+
+  on('command.run', { command: 'session-title-mark' }, async $ => {
+    const isOff = !((await $.store.get(MARKS_OFF_KEY).catch(() => undefined)) === true)
+    await $.store.set(MARKS_OFF_KEY, isOff)
+    me.isTitleOff = isOff
+    // Turning marks on again forgets the last one, so it is put back.
+    me.mark = isOff ? me.mark : ''
+    await publish($)
+    return {
+      text: isOff
+        ? 'Значок в названии чата выключен во всех сессиях (снят в этой; в остальных снимется при смене статуса).'
+        : 'Значок в названии чата включён.',
+    }
   })
 
   on('command.run', { command: 'session-band' }, async $ => {
@@ -450,83 +579,106 @@ export const register: Register = on => {
         {agentsText(Text, record)}
         {record.git !== null && <Text dimColor>·</Text>}
         {record.git !== null && gitText(Text, record.git)}
-        <Button key="open" plain label="Все сессии" onPress={() => fire(openPane($))} />
+        <Button key="open" plain label="Сессии проекта" onPress={() => fire(openPane($))} />
       </Box>
     )
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text, Link } = $.ui.resolve(e)
+    const mine = await read($, self)
+    const key = mine === null ? null : keyOf(mine)
+    const records = (await read($, all)).filter(r => keyOf(r) === key)
+    return sessionsTree($, $.ui.resolve(e), records, await $.clock.now(), false)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE_ALL }, async ($, e) => {
     const records = await read($, all)
-    const now = await $.clock.now()
-
-    const groups = new Map<string, SessionRecord[]>()
-    for (const record of records) {
-      const key = record.git?.repo ?? record.cwd
-      groups.set(key, [...(groups.get(key) ?? []), record])
-    }
-    const working = records.filter(r => isLive(r, now) && r.activity !== 'idle').length
-
-    return (
-      <Box flexDirection="column" rowGap={1}>
-        <Box flexDirection="row" columnGap={1} alignItems="center">
-          <Text dimColor>
-            {records.length === 0
-              ? 'Пока нет сессий с этим плагином.'
-              : `Сессий: ${records.length}, в работе: ${working}`}
-          </Text>
-          <Button key="refresh" plain label="Обновить" onPress={() => fire(refreshAll($))} />
-        </Box>
-        {[...groups.entries()].map(([key, list]) => {
-          const git = list
-            .map(r => r.git)
-            .filter((g): g is GitStatus => g !== null)
-            .sort((a, b) => b.checkedAt - a.checkedAt)[0]
-          return (
-            <Box key={key} flexDirection="column">
-              <Text bold wrap="truncate-end">
-                {git?.repo ?? list[0]?.project ?? key}
-              </Text>
-              {git !== undefined && (
-                <Box flexDirection="row" columnGap={1} flexWrap="wrap">
-                  {gitText(Text, git)}
-                  {git.ciUrl !== null && <Link href={git.ciUrl} label="открыть сборку" />}
-                </Box>
-              )}
-              {list.map(record => (
-                <Box key={record.id} flexDirection="column" paddingLeft={2}>
-                  <Box flexDirection="row" columnGap={1} flexWrap="wrap">
-                    {activityText(Text, record, now)}
-                    <Text dimColor>·</Text>
-                    {modelText(Text, record)}
-                    {agentsText(Text, record)}
-                  </Box>
-                  {record.title !== '' && (
-                    <Text dimColor wrap="truncate-end">
-                      {record.title}
-                    </Text>
-                  )}
-                  {record.agents
-                    .filter(a => ACTIVE_AGENT.has(a.status))
-                    .map(a => (
-                      <Text dimColor wrap="truncate-end">
-                        {'  ↳ '}
-                        {a.label}
-                        {a.model !== null ? ` · ${prettyModel(a.model)}` : ''}
-                        {a.effort !== null ? ` · ${a.effort}` : ''}
-                      </Text>
-                    ))}
-                </Box>
-              ))}
-            </Box>
-          )
-        })}
-      </Box>
-    )
+    return sessionsTree($, $.ui.resolve(e), records, await $.clock.now(), true)
   })
 }
 
-type TextCtor = ReturnType<EngineInterface['ui']['resolve']>['Text']
+type Ui = ReturnType<EngineInterface['ui']['resolve']>
+
+// The pane's body: sessions grouped by project, each project with its last
+// commit and build. One project alone draws no project heading.
+function sessionsTree(
+  $: EngineInterface,
+  { Box, Button, Text, Link }: Ui,
+  records: SessionRecord[],
+  now: number,
+  isAll: boolean,
+) {
+  const shown = records.filter(r => isLive(r, now) || now - r.updatedAt < CLOSED_KEEP_MS)
+  const groups = new Map<string, SessionRecord[]>()
+  for (const record of shown) {
+    groups.set(keyOf(record), [...(groups.get(keyOf(record)) ?? []), record])
+  }
+  const working = shown.filter(r => isLive(r, now) && r.activity !== 'idle').length
+
+  return (
+    <Box flexDirection="column" rowGap={1}>
+      <Box flexDirection="row" columnGap={1} alignItems="center" flexWrap="wrap">
+        <Text dimColor>
+          {shown.length === 0
+            ? 'Нет сессий.'
+            : `${isAll ? 'Проектов' : 'Сессий'}: ${isAll ? groups.size : shown.length}, в работе: ${working}`}
+        </Text>
+        <Button key="refresh" plain label="Обновить" onPress={() => fire(refreshAll($))} />
+        {isAll ? null : (
+          <Button key="all" plain label="Все проекты" onPress={() => fire(openPane($, true))} />
+        )}
+      </Box>
+      {[...groups.entries()].map(([key, list]) => {
+        const git = list
+          .map(r => r.git)
+          .filter((g): g is GitStatus => g !== null)
+          .sort((a, b) => b.checkedAt - a.checkedAt)[0]
+        return (
+          <Box key={key} flexDirection="column">
+            {isAll && (
+              <Text bold wrap="truncate-end">
+                {git?.repo ?? list[0]?.project ?? key}
+              </Text>
+            )}
+            {git !== undefined && (
+              <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+                {gitText(Text, git)}
+                {git.ciUrl !== null && <Link href={git.ciUrl} label="открыть сборку" />}
+              </Box>
+            )}
+            {list.map(record => (
+              <Box key={record.id} flexDirection="column" paddingLeft={isAll ? 2 : 0} paddingTop={isAll ? 0 : 1}>
+                {record.title !== '' && (
+                  <Text wrap="truncate-end">
+                    {record.title}
+                  </Text>
+                )}
+                <Box flexDirection="row" columnGap={1} flexWrap="wrap">
+                  {activityText(Text, record, now)}
+                  <Text dimColor>·</Text>
+                  {modelText(Text, record)}
+                  {agentsText(Text, record)}
+                </Box>
+                {record.agents
+                  .filter(a => ACTIVE_AGENT.has(a.status))
+                  .map(a => (
+                    <Text dimColor wrap="truncate-end">
+                      {'  ↳ '}
+                      {a.label}
+                      {a.model !== null ? ` · ${prettyModel(a.model)}` : ''}
+                      {a.effort !== null ? ` · ${a.effort}` : ''}
+                    </Text>
+                  ))}
+              </Box>
+            ))}
+          </Box>
+        )
+      })}
+    </Box>
+  )
+}
+
+type TextCtor = Ui['Text']
 
 function activityText(Text: TextCtor, record: SessionRecord, now: number) {
   if (!isLive(record, now)) {

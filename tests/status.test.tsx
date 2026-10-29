@@ -98,3 +98,85 @@ test('the band and the pane show the session, its agents and CI', async ($, on) 
     await pane.unmount()
   }
 })
+
+test('the chat title in the app gets the status mark, and the toggle takes it off', async ($, on) => {
+  let title = 'Анализ звонков'
+  const titles: string[] = []
+  const files = new Map<string, string>()
+  const other = {
+    id: 'o1', title: 'Чужой проект', cwd: '/w/other', project: 'other', activity: 'idle',
+    since: Date.now(), model: 'claude-haiku-5-5', effort: 'low', agents: [],
+    updatedAt: Date.now(), git: null,
+  }
+  files.set('/home/me/.claude/session-status/o1.json', JSON.stringify(other))
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: Date.now() }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: '/home/me' }))
+  on('store.get', () => ({ value: undefined }))
+  on('store.set', () => ({ value: undefined }))
+  on('session.id', () => ({ value: 's2' }))
+  on('session.root', () => ({ value: '/w/proj' }))
+  on('session.cwd', () => ({ value: '/w/proj' }))
+  on('session.model', () => ({ value: 'claude-sonnet-5-5' }))
+  on('session.messages', () => ({ value: [] }))
+  on('session.repo', () => ({
+    value: { root: '/w/proj', remote: 'https://github.com/o/r.git', internal: false, name: null },
+  }))
+  on('settings.read', () => ({ value: {} }))
+  on('agent.list', () => ({ value: [] }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', (_, e) => {
+    files.set(e.path, e.text)
+    return { value: undefined }
+  })
+  on('fs.list', () => ({
+    value: [...files.keys()].map(path => ({
+      name: path.split('/').pop(), kind: 'file', size: 1, mtimeMs: Date.now(), isLink: false,
+    })),
+  }))
+  on('fs.read', (_, e) => ({ value: files.get(e.path) ?? '' }))
+  on('process.run', (_, e) => {
+    const line = e.argv.join(' ')
+    const hit = OUT.find(([re]) => re.test(line))
+    return { value: { exitCode: hit ? 0 : 1, stdout: hit?.[1] ?? '', stderr: '' } }
+  })
+  on('tool.check', () => ({ decision: 'allow' }))
+  on('tool.call', (_, e) => {
+    if (e.tool === 'mcp__ccd_session_mgmt__set_session_title') {
+      title = String((e as unknown as { title: string }).title)
+      titles.push(title)
+    }
+    return {
+      result: {},
+      text: JSON.stringify({ title, model: 'claude-opus-5-5', effort: 'xhigh' }),
+    }
+  })
+
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  for (let i = 0; i < 200 && title !== '✗ Анализ звонков'; i++) {
+    await $.command.run({ command: 'session-band', args: '' })
+  }
+  expect(title).toBe('✗ Анализ звонков')
+  // The mark is replaced, never stacked.
+  expect(titles.every(t => /^[●◐✓✗◷○] Анализ звонков$/.test(t))).toBe(true)
+
+  // An idle session shows the effort picked in the app, not settings.json's.
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /Opus 5\.5/ }))?.text).toBe('Opus 5.5 · xhigh')
+  await band.unmount()
+
+  // The project's pane lists this project alone; the other pane lists both.
+  const project = await $.ui.mount({ ...PANE, requestId: 'session-status-project', surface: 'desktop' })
+  expect(await project.find({ type: 'Text', text: /Анализ звонков/ })).toBeDefined()
+  expect(await project.find({ type: 'Text', text: /Чужой проект/ })).toBeUndefined()
+  await project.unmount()
+  const everything = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await everything.find({ type: 'Text', text: /Чужой проект/ })).toBeDefined()
+  await everything.unmount()
+
+  await $.command.run({ command: 'session-title-mark', args: '' })
+  expect(title).toBe('Анализ звонков')
+})
