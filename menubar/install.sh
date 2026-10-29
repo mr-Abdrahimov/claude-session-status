@@ -29,7 +29,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>$NAME</string>
   <key>CFBundleExecutable</key><string>SessionStatusBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.3.1</string>
+  <key>CFBundleShortVersionString</key><string>0.3.2</string>
   <key>LSUIElement</key><true/>
 </dict>
 </plist>

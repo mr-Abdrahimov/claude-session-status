@@ -8,6 +8,8 @@ struct GitStatus: Decodable {
     let repo: String?
     let branch: String
     let short: String
+    let subject: String?
+    let when: String?
     let ahead: Int
     let dirty: Int?
     let ci: String
@@ -151,14 +153,22 @@ func activitySymbol(_ record: SessionRecord, now: Double) -> String {
     }
 }
 
+let titleFont = NSFont.systemFont(ofSize: 14, weight: .medium)
 let rowFont = NSFont.menuFont(ofSize: 13)
-let activityColumn: CGFloat = 22
-let taskColumn: CGFloat = 158
-let detailColumn: CGFloat = 470
+let detailFont = NSFont.menuFont(ofSize: 12)
+// Two status symbols, then the text: every line of a task starts here.
+let textColumn: CGFloat = 50
+// Long titles and commit subjects are cut so the menu stays narrow.
+let titleLimit = 46
+let detailLimit = 44
+
+func cut(_ text: String, _ limit: Int) -> String {
+    text.count > limit ? String(text.prefix(limit - 1)) + "…" : text
+}
 
 // A symbol drawn at the text's size in one color, sitting on the baseline.
-func icon(_ name: String, _ color: NSColor) -> NSAttributedString {
-    let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+func icon(_ name: String, _ color: NSColor, size: CGFloat = 12) -> NSAttributedString {
+    let config = NSImage.SymbolConfiguration(pointSize: size, weight: .medium)
         // A filled badge draws its glyph in white over the color, so a pencil
         // and a check stay apart even at menu bar size.
         .applying(NSImage.SymbolConfiguration(
@@ -167,7 +177,7 @@ func icon(_ name: String, _ color: NSColor) -> NSAttributedString {
         .withSymbolConfiguration(config) else { return NSAttributedString(string: "•") }
     let attachment = NSTextAttachment()
     attachment.image = image
-    attachment.bounds = CGRect(x: 0, y: -2, width: 14, height: 14)
+    attachment.bounds = CGRect(x: 0, y: -(size - 8) / 2, width: size + 2, height: size + 2)
     return NSAttributedString(attachment: attachment)
 }
 
@@ -246,32 +256,6 @@ final class StatusController: NSObject, NSMenuDelegate {
     // agents working on it, each with its own model and level.
     var hoverText: String { tooltip(now: Date().timeIntervalSince1970) }
 
-    func snapshot(to path: String) {
-        let menu = NSMenu()
-        menuNeedsUpdate(menu)
-        let rowHeight: CGFloat = 22, width: CGFloat = 1000
-        let size = NSSize(width: width, height: rowHeight * CGFloat(menu.items.count) + 12)
-        let image = NSImage(size: size)
-        image.lockFocus()
-        NSColor.windowBackgroundColor.setFill()
-        NSRect(origin: .zero, size: size).fill()
-        for (index, menuItem) in menu.items.enumerated() {
-            let y = size.height - 6 - rowHeight * CGFloat(index + 1)
-            if menuItem.isSeparatorItem {
-                NSColor.separatorColor.setFill()
-                NSRect(x: 14, y: y + rowHeight / 2, width: width - 28, height: 1).fill()
-            } else {
-                let text = menuItem.attributedTitle ?? NSAttributedString(string: menuItem.title, attributes: [.font: rowFont])
-                text.draw(in: NSRect(x: 14, y: y + 3, width: width - 28, height: rowHeight))
-            }
-        }
-        image.unlockFocus()
-        if let tiff = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiff),
-           let png = bitmap.representation(using: .png, properties: [:]) {
-            try? png.write(to: URL(fileURLWithPath: path))
-        }
-    }
-
     private func tooltip(now: Double) -> String {
         let live = records.filter { isLive($0, now: now) }
         if live.isEmpty { return "Нет открытых чатов Claude Code" }
@@ -279,17 +263,27 @@ final class StatusController: NSObject, NSMenuDelegate {
         for record in live {
             let (mark, activity, _) = activityMark(record, now: now)
             let title = record.title.isEmpty ? record.project : record.title
-            let short = title.count > 60 ? String(title.prefix(59)) + "…" : title
             let gitStage = stage(of: record.git)
             let stageText = record.git == nil ? "" : " · \(gitStage.mark) \(gitStage.label)"
-            lines.append("\(mark) \(short)")
+            lines.append("\(mark) \(cut(title, 60))")
             lines.append("    \(activity) · \(modelLine(record.model, record.effort))\(stageText)")
             for agent in record.agents where activeAgent.contains(agent.status) {
-                let label = agent.label.count > 50 ? String(agent.label.prefix(49)) + "…" : agent.label
-                lines.append("    ↳ \(label) — \(modelLine(agent.model, agent.effort))")
+                lines.append("    ↳ \(cut(agent.label, 50)) — \(modelLine(agent.model, agent.effort))")
             }
         }
         return lines.joined(separator: "\n")
+    }
+
+    // Opens the real menu for a few seconds, then quits: a check without a mouse.
+    func showMenu(for seconds: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [self] in
+            let close = Timer(timeInterval: seconds, repeats: false) { [self] _ in
+                item.menu?.cancelTracking()
+                exit(0)
+            }
+            RunLoop.main.add(close, forMode: .common)
+            item.button?.performClick(nil)
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -310,57 +304,60 @@ final class StatusController: NSObject, NSMenuDelegate {
         }
         for (key, list) in groups {
             if menu.items.count > 0 { menu.addItem(.separator()) }
-            let header = NSMenuItem()
-            header.attributedTitle = NSAttributedString(
-                string: key.split(separator: "/").last.map(String.init) ?? key,
-                attributes: [.font: NSFont.boldSystemFont(ofSize: 13)])
-            header.isEnabled = false
-            menu.addItem(header)
+            menu.addItem(projectItem(key, list, now: now))
             for record in list {
                 menu.addItem(taskItem(record, now: now))
                 for agent in record.agents where activeAgent.contains(agent.status) {
                     menu.addItem(agentItem(agent))
                 }
             }
-            if let git = list.compactMap({ $0.git }).first, let url = git.ciUrl {
-                let open = NSMenuItem(title: "", action: #selector(openURL(_:)), keyEquivalent: "")
-                open.attributedTitle = row(
-                    [plain("\t\tОткрыть сборку \(git.ciName)", .linkColor)], color: .linkColor)
-                open.target = self
-                open.representedObject = url
-                menu.addItem(open)
-            }
         }
         menu.addItem(.separator())
-        let legend = NSMutableAttributedString()
-        for stageCase in [Stage.uncommitted, .committed, .deploying, .failed, .succeeded] {
-            legend.append(icon(stageCase.symbol, stageCase.color))
-            legend.append(plain(" \(stageCase.label)   ", .secondaryLabelColor))
-        }
-        let legendItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        legendItem.attributedTitle = legend
-        legendItem.isEnabled = false
-        menu.addItem(legendItem)
-        let quit = NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        menu.addItem(legendItem())
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
-    // Every row is laid out in the same columns: activity, the stage of the
-    // changes, the task, then the details, so the statuses line up on the left.
-    private func row(_ parts: [NSAttributedString], color: NSColor) -> NSMutableAttributedString {
+    private func style() -> NSParagraphStyle {
         let style = NSMutableParagraphStyle()
-        style.tabStops = [
-            NSTextTab(textAlignment: .left, location: activityColumn),
-            NSTextTab(textAlignment: .left, location: taskColumn),
-            NSTextTab(textAlignment: .left, location: detailColumn),
-        ]
-        let text = NSMutableAttributedString()
-        for part in parts { text.append(part) }
-        text.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: text.length))
+        style.tabStops = [NSTextTab(textAlignment: .left, location: textColumn)]
+        style.headIndent = textColumn
+        style.lineSpacing = 2
+        return style
+    }
+
+    private func styled(_ text: NSMutableAttributedString) -> NSAttributedString {
+        text.addAttribute(.paragraphStyle, value: style(), range: NSRange(location: 0, length: text.length))
         return text
     }
 
-    // One chat: its activity, the stage of its changes, its task. A click
+    // The project: its name, and the build of its last pushed commit with a
+    // link to it.
+    private func projectItem(_ key: String, _ list: [SessionRecord], now: Double) -> NSMenuItem {
+        let name = key.split(separator: "/").last.map(String.init) ?? key
+        let text = NSMutableAttributedString(string: name, attributes: [
+            .font: NSFont.systemFont(ofSize: 13, weight: .bold), .foregroundColor: NSColor.labelColor])
+        let git = list.filter { isLive($0, now: now) }.compactMap { $0.git }.first
+        if let git = git, git.ci != "unknown" {
+            let ciStage: Stage = git.ci == "success" ? .succeeded : git.ci == "failure" ? .failed
+                : git.ci == "pending" ? .deploying : .none
+            text.append(NSAttributedString(string: "   ", attributes: [.font: rowFont]))
+            text.append(icon(ciStage.symbol, ciStage.color))
+            let what = git.ciName.isEmpty ? "сборок нет" : git.ciName
+            text.append(NSAttributedString(string: " \(cut(what, 30))", attributes: [
+                .font: detailFont, .foregroundColor: NSColor.secondaryLabelColor]))
+        }
+        let menuItem = NSMenuItem(title: "", action: #selector(openURL(_:)), keyEquivalent: "")
+        menuItem.attributedTitle = text
+        menuItem.target = self
+        menuItem.representedObject = git?.ciUrl
+        menuItem.isEnabled = git?.ciUrl != nil
+        menuItem.toolTip = git?.ciUrl == nil ? nil : "Открыть сборку на GitHub"
+        return menuItem
+    }
+
+    // One chat as a block: two status symbols and the task, then what it is
+    // doing and on which model, then where its last commit stands. A click
     // opens the chat in the Claude app.
     private func taskItem(_ record: SessionRecord, now: Double) -> NSMenuItem {
         let (_, activity, activityColor) = activityMark(record, now: now)
@@ -368,38 +365,78 @@ final class StatusController: NSObject, NSMenuDelegate {
         // A closed chat's git status is as old as its last write: not shown.
         let gitStage: Stage? = live && record.git != nil ? stage(of: record.git) : nil
         let title = record.title.isEmpty ? record.project : record.title
-        let short = title.count > 42 ? String(title.prefix(41)) + "…" : title
-        var detail = "\(activity) \(ago(now - record.since / 1000)) · \(modelLine(record.model, record.effort))"
-        if let git = record.git, live {
-            detail += " · \(git.branch)"
-            if let dirty = git.dirty, dirty > 0 { detail += " · файлов: \(dirty)" }
-            if git.ahead > 0 { detail += " · коммитов: \(git.ahead)" }
-        }
-        var parts = [icon(activitySymbol(record, now: now), activityColor), plain("\t")]
+        let text = NSMutableAttributedString()
+        text.append(icon(activitySymbol(record, now: now), activityColor, size: 15))
+        text.append(NSAttributedString(string: " ", attributes: [.font: rowFont]))
         if let gitStage = gitStage {
-            parts += [icon(gitStage.symbol, gitStage.color), plain(" \(gitStage.label)", gitStage.color)]
+            text.append(icon(gitStage.symbol, gitStage.color, size: 15))
         } else {
-            parts += [icon("minus", .tertiaryLabelColor)]
+            text.append(icon("minus.circle", .quaternaryLabelColor, size: 15))
         }
-        parts += [
-            plain("\t" + short, live ? .labelColor : .secondaryLabelColor),
-            plain("\t" + detail, .secondaryLabelColor),
-        ]
+        text.append(NSAttributedString(string: "\t" + cut(title, titleLimit), attributes: [
+            .font: titleFont, .foregroundColor: live ? NSColor.labelColor : NSColor.secondaryLabelColor]))
+
+        let active = record.agents.filter { activeAgent.contains($0.status) }.count
+        var doing = "\(activity) \(ago(now - record.since / 1000)) · \(modelLine(record.model, record.effort))"
+        if active > 0 { doing += " · агентов: \(active)" }
+        text.append(NSAttributedString(string: "\u{2028}" + doing, attributes: [
+            .font: detailFont, .foregroundColor: NSColor.secondaryLabelColor]))
+
+        if let git = record.git, live {
+            var commit = "\(git.branch) · \(git.short)"
+            if let subject = git.subject, !subject.isEmpty { commit += " «\(cut(subject, detailLimit - commit.count))»" }
+            if let when = git.when, !when.isEmpty { commit += " · \(when)" }
+            var changes: [String] = []
+            if let dirty = git.dirty, dirty > 0 { changes.append("изменено файлов: \(dirty)") }
+            if git.ahead > 0 { changes.append("не запушено коммитов: \(git.ahead)") }
+            text.append(NSAttributedString(string: "\u{2028}" + commit, attributes: [
+                .font: detailFont, .foregroundColor: NSColor.secondaryLabelColor]))
+            if !changes.isEmpty {
+                text.append(NSAttributedString(string: "\u{2028}" + changes.joined(separator: " · "), attributes: [
+                    .font: detailFont, .foregroundColor: Stage.uncommitted.color]))
+            }
+        }
         let menuItem = NSMenuItem(title: "", action: #selector(openChat(_:)), keyEquivalent: "")
-        menuItem.attributedTitle = row(parts, color: .labelColor)
+        menuItem.attributedTitle = styled(text)
         menuItem.target = self
         menuItem.representedObject = record.appId
         menuItem.isEnabled = !(record.appId ?? "").isEmpty
+        menuItem.toolTip = menuItem.isEnabled ? "Открыть чат в Claude" : nil
         return menuItem
     }
 
     private func agentItem(_ agent: AgentRow) -> NSMenuItem {
-        let label = agent.label.count > 40 ? String(agent.label.prefix(39)) + "…" : agent.label
+        let text = NSMutableAttributedString(string: "\t↳ " + cut(agent.label, 34), attributes: [
+            .font: rowFont, .foregroundColor: NSColor.labelColor])
+        text.append(NSAttributedString(string: "  " + modelLine(agent.model, agent.effort), attributes: [
+            .font: detailFont, .foregroundColor: NSColor.secondaryLabelColor]))
         let menuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        menuItem.attributedTitle = row([
-            plain("\t\t↳ " + label, .secondaryLabelColor),
-            plain("\t" + modelLine(agent.model, agent.effort), .secondaryLabelColor),
-        ], color: .secondaryLabelColor)
+        menuItem.attributedTitle = styled(text)
+        menuItem.isEnabled = false
+        return menuItem
+    }
+
+    // What the symbols mean: the chat's activity, then its changes' stage.
+    private func legendItem() -> NSMenuItem {
+        let text = NSMutableAttributedString()
+        func add(_ symbol: String, _ color: NSColor, _ label: String) {
+            text.append(icon(symbol, color))
+            text.append(NSAttributedString(string: " \(label)    ", attributes: [
+                .font: detailFont, .foregroundColor: NSColor.secondaryLabelColor]))
+        }
+        add("circle.fill", .systemOrange, "работает")
+        add("circle.lefthalf.filled", .systemYellow, "ждёт разрешения")
+        add("circle", .secondaryLabelColor, "готов")
+        add("circle.dashed", .tertiaryLabelColor, "закрыт")
+        text.append(NSAttributedString(string: "\u{2028}", attributes: [.font: detailFont]))
+        for stageCase in [Stage.uncommitted, .committed, .deploying, .failed, .succeeded] {
+            add(stageCase.symbol, stageCase.color, stageCase.label)
+        }
+        let menuItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        let style = NSMutableParagraphStyle()
+        style.lineSpacing = 4
+        text.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: text.length))
+        menuItem.attributedTitle = text
         menuItem.isEnabled = false
         return menuItem
     }
@@ -430,9 +467,7 @@ if CommandLine.arguments.contains("--print") {
     print(controller.hoverText)
     exit(0)
 }
-// `--snapshot <file.png>` draws the menu's rows to a picture and exits.
-if let flag = CommandLine.arguments.firstIndex(of: "--snapshot"), flag + 1 < CommandLine.arguments.count {
-    controller.snapshot(to: CommandLine.arguments[flag + 1])
-    exit(0)
+if CommandLine.arguments.contains("--show-menu") {
+    controller.showMenu(for: 6)
 }
 app.run()
