@@ -444,8 +444,11 @@ async function followId($: EngineInterface): Promise<void> {
   asking.clear()
 }
 
-// A press on one of the commit offer's buttons: a prompt of the person's
-// own, or «Подождать», which hides the offer for this commit for a while.
+// A press on one of the commit offer's buttons, or «Подождать», which hides
+// the offer for this commit for a while. The request goes into the prompt
+// box for the person to send: a prompt the plugin submitted reaches Claude as
+// the plugin's, and Claude rightly will not push to production on a plugin's
+// word. A draft already typed is kept, the request added after it.
 async function answerGitOffer(
   $: EngineInterface,
   choice: keyof typeof GIT_PROMPTS | 'wait',
@@ -453,7 +456,18 @@ async function answerGitOffer(
   const sha = me.git?.sha ?? ''
   const until = (await $.clock.now()) + POSTPONE_MS
   await update($, gitOfferPostponed, () => `${sha}|${until}`)
-  if (choice !== 'wait') await $.prompt.submit({ text: GIT_PROMPTS[choice] })
+  if (choice === 'wait') return
+  const draft = (await $.prompt.read()).text.trim()
+  const filled = await $.prompt.fill(
+    draft === ''
+      ? { text: GIT_PROMPTS[choice], mode: 'replace' }
+      : { text: `\n\n${GIT_PROMPTS[choice]}`, mode: 'append' },
+  )
+  $.ui.toast(
+    filled.isFilled
+      ? 'Запрос в поле ввода: нажмите Enter, чтобы отправить'
+      : 'Не удалось вставить запрос в поле ввода',
+  )
 }
 
 function isOfferPostponed(postponed: string, git: GitStatus, now: number): boolean {

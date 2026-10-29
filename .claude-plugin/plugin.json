@@ -1,6 +1,6 @@
 {
   "name": "session-status",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Статус чатов: идёт ли работа, сколько агентов, модель и effort, последний коммит и его сборка на GitHub",
   "author": { "name": "mr-Abdrahimov" },
   "license": "MIT",

@@ -218,10 +218,12 @@ test('uncommitted changes offer commit, commit and push, push or wait', async ($
     const { Text } = $.ui.resolve(e)
     return <Text>engine</Text>
   })
-  on('prompt.submit', (_, e) => {
+  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
+  on('prompt.fill', (_, e) => {
     prompts.push(e.text)
-    return { text: e.text }
+    return { isFilled: true }
   })
+  on('ui.toast', () => ({ value: undefined }))
 
   await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
   const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
