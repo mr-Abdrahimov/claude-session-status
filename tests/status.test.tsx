@@ -88,8 +88,9 @@ test('the band and the pane show the session, its agents and CI', async ($, on) 
     expect((await band.find({ type: 'Text', text: /сборка упала/ }))?.text).toBe(
       'main abc123 «feat: status pane» 2 minutes ago ✗ сборка упала (CI)',
     )
-    expect((await band.find({ type: 'Text', text: /работает/ }))).toBeUndefined()
-    expect((await band.find({ type: 'Text', text: /готов/ }))).toBeDefined()
+    // No turn runs, but an agent does: the chat is still working.
+    expect((await band.find({ type: 'Text', text: /работает/ }))).toBeDefined()
+    expect((await band.find({ type: 'Text', text: /готов/ }))).toBeUndefined()
     await band.unmount()
 
     const pane = await $.ui.mount({ ...PANE, surface })
@@ -240,6 +241,65 @@ test('uncommitted changes offer commit, commit and push, push or wait', async ($
   expect(prompts[0]).toContain('Закоммить изменения этой задачи')
   expect(prompts[0]).toContain('Не пушь')
   // A choice made hides the offer for this commit.
+  expect(await band.find({ type: 'Text', text: /не закоммичено файлов/ })).toBeUndefined()
+  await band.unmount()
+})
+
+test('no commit is offered while a background agent still works', async ($, on) => {
+  const prompts: string[] = []
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: Date.now() }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: '/home/me' }))
+  on('store.get', () => ({ value: true }))
+  on('session.id', () => ({ value: 's4' }))
+  on('session.root', () => ({ value: '/w/proj' }))
+  on('session.cwd', () => ({ value: '/w/proj' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.messages', () => ({ value: [] }))
+  on('session.repo', () => ({
+    value: { root: '/w/proj', remote: 'git@github.com:o/r.git', internal: false, name: null },
+  }))
+  on('settings.read', () => ({ value: {} }))
+  on('agent.list', () => ({
+    value: [{ id: 'a1', description: 'экраны', type: 'general-purpose', status: 'running' }],
+  }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ value: '' }))
+  on('process.run', (_, e) => {
+    const line = e.argv.join(' ')
+    if (/status --porcelain/.test(line)) {
+      return { value: { exitCode: 0, stdout: ' M a.ts\n M b.ts', stderr: '' } }
+    }
+    if (/rev-list --count/.test(line)) return { value: { exitCode: 0, stdout: '1', stderr: '' } }
+    const hit = OUT.find(([re]) => re.test(line))
+    return { value: { exitCode: hit ? 0 : 1, stdout: hit?.[1] ?? '', stderr: '' } }
+  })
+  // The engine's own band, drawn while the mod has nothing to show.
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
+  on('prompt.fill', (_, e) => {
+    prompts.push(e.text)
+    return { isFilled: true }
+  })
+  on('ui.toast', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  for (let i = 0; i < 200 && (await band.find({ type: 'Text', text: /изменено|не закоммичено: 2/ })) === undefined; i++) {
+    await $.command.run({ command: 'session-band', args: '' })
+    await $.command.run({ command: 'session-band', args: '' })
+  }
+  // The git state has arrived, yet the turn's work goes on in the background.
+  expect(await band.find({ type: 'Text', text: /не закоммичено: 2/ })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: /работает/ })).toBeDefined()
   expect(await band.find({ type: 'Text', text: /не закоммичено файлов/ })).toBeUndefined()
   await band.unmount()
 })

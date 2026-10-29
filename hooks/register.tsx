@@ -84,6 +84,11 @@ const me = {
   // The app's id of this chat (local_…), which opens it from outside.
   appId: '',
   isGitQueued: false,
+  // Background work the last turn left running (agents, shells, monitors,
+  // workflows), from the Stop hook: the chat is not done while it runs.
+  backgroundTasks: 0,
+  // The activity last published: idle with background work shows as working.
+  shown: 'idle' as Activity,
 }
 const agentSteps = new Map<string, Step>()
 // Tool calls whose permission prompt is open, by tool_use_id.
@@ -372,9 +377,19 @@ async function readApp(
   return app
 }
 
+const RUNNING_TASK = new Set(['running', 'pending'])
+
+// A turn that ended while agents or other background work still run has not
+// finished the task: it shows as working, and no commit is offered.
+function shownActivity(list: AgentRow[]): Activity {
+  const isBusy = me.backgroundTasks > 0 || list.some(a => ACTIVE_AGENT.has(a.status))
+  me.shown = me.activity === 'idle' && isBusy ? 'working' : me.activity
+  return me.shown
+}
+
 function markOf(): string {
-  if (me.activity === 'working') return '●'
-  if (me.activity === 'waiting') return '◐'
+  if (me.shown === 'working') return '●'
+  if (me.shown === 'waiting') return '◐'
   if (me.git?.ci === 'success') return '✓'
   if (me.git?.ci === 'failure') return '✗'
   if (me.git?.ci === 'pending') return '◷'
@@ -412,7 +427,7 @@ async function writeRecord($: EngineInterface): Promise<void> {
     title: me.title,
     cwd: me.cwd,
     project: (me.git?.repo ?? me.cwd).split('/').pop() ?? me.cwd,
-    activity: me.activity,
+    activity: shownActivity(list),
     since: me.since,
     model: me.model,
     effort: me.effort,
@@ -552,6 +567,11 @@ export const register: Register = on => {
       agentSteps.set(e.agentId, step)
     }
     return yield* next(e)
+  })
+
+  on('classic.Stop', async ($, e, next) => {
+    me.backgroundTasks = (e.background_tasks ?? []).filter(t => RUNNING_TASK.has(t.status)).length
+    return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
