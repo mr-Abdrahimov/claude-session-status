@@ -94,8 +94,14 @@ function parseRepo(remote: string | null): string | null {
   return m === null ? null : `${m[1]}/${m[2]}`
 }
 
+// The app prepends system-reminder blocks and other tags to a prompt: the
+// title is the first line of what the person typed.
 function firstLine(text: string): string {
-  return (text.split('\n')[0] ?? '').slice(0, 80)
+  const typed = text
+    .replace(/<([a-z][\w-]*)[^>]*>[\s\S]*?<\/\1>/gi, '')
+    .replace(/<[^>]+>/g, '')
+  const line = typed.split('\n').map(l => l.trim()).find(l => l !== '') ?? ''
+  return line.slice(0, 80)
 }
 
 function effortOf(value: unknown): string | null {
