@@ -51,6 +51,9 @@ declare module 'claude-code' {
       self: Shaped<SessionRecord | null>
       all: Shaped<SessionRecord[]>
       isBandHidden: boolean
+      // "<HEAD sha>|<until, ms>": the commit offer is hidden for that commit
+      // until then, after the person chose to wait.
+      gitOfferPostponed: string
     }
   }
 }

@@ -180,3 +180,64 @@ test('the chat title in the app gets the status mark, and the toggle takes it of
   await $.command.run({ command: 'session-title-mark', args: '' })
   expect(title).toBe('Анализ звонков')
 })
+
+test('uncommitted changes offer commit, commit and push, push or wait', async ($, on) => {
+  const prompts: string[] = []
+  on('command.register', () => ({ value: { command: 'x' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('clock.now', () => ({ value: Date.now() }))
+  on('clock.every', () => ({ value: undefined }))
+  on('clock.after', () => ({ value: undefined }))
+  on('env.get', () => ({ value: '/home/me' }))
+  on('store.get', () => ({ value: true }))
+  on('session.id', () => ({ value: 's3' }))
+  on('session.root', () => ({ value: '/w/proj' }))
+  on('session.cwd', () => ({ value: '/w/proj' }))
+  on('session.model', () => ({ value: 'claude-opus-5-5' }))
+  on('session.messages', () => ({ value: [] }))
+  on('session.repo', () => ({
+    value: { root: '/w/proj', remote: 'git@github.com:o/r.git', internal: false, name: null },
+  }))
+  on('settings.read', () => ({ value: {} }))
+  on('agent.list', () => ({ value: [] }))
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', () => ({ value: undefined }))
+  on('fs.list', () => ({ value: [] }))
+  on('fs.read', () => ({ value: '' }))
+  on('process.run', (_, e) => {
+    const line = e.argv.join(' ')
+    if (/status --porcelain/.test(line)) {
+      return { value: { exitCode: 0, stdout: ' M a.ts\n M b.ts', stderr: '' } }
+    }
+    if (/rev-list --count/.test(line)) return { value: { exitCode: 0, stdout: '1', stderr: '' } }
+    const hit = OUT.find(([re]) => re.test(line))
+    return { value: { exitCode: hit ? 0 : 1, stdout: hit?.[1] ?? '', stderr: '' } }
+  })
+  // The engine's own band, drawn while the mod has nothing to show.
+  on('ui.render', ($, e) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  on('prompt.submit', (_, e) => {
+    prompts.push(e.text)
+    return { text: e.text }
+  })
+
+  await $.session.start({ cwd: '/w/proj', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  for (let i = 0; i < 200 && (await band.find({ type: 'Text', text: /не закоммичено файлов/ })) === undefined; i++) {
+    await $.command.run({ command: 'session-band', args: '' })
+    await $.command.run({ command: 'session-band', args: '' })
+  }
+  expect((await band.find({ type: 'Text', text: /не закоммичено файлов/ }))?.text).toBe(
+    '✎ не закоммичено файлов: 2 · не запушено коммитов: 1',
+  )
+
+  await band.press({ key: 'commit' })
+  expect(prompts.length).toBe(1)
+  expect(prompts[0]).toContain('Закоммить изменения этой задачи')
+  expect(prompts[0]).toContain('Не пушь')
+  // A choice made hides the offer for this commit.
+  expect(await band.find({ type: 'Text', text: /не закоммичено файлов/ })).toBeUndefined()
+  await band.unmount()
+})

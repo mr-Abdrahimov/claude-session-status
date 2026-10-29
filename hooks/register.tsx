@@ -32,6 +32,24 @@ const isBandHidden = atom(
   { plugin: 'session-status', key: 'isBandHidden' } as const,
   false,
 )
+const gitOfferPostponed = atom(
+  { plugin: 'session-status', key: 'gitOfferPostponed' } as const,
+  '',
+)
+// «Подождать» hides the commit offer this long, or until the next commit.
+const POSTPONE_MS = 60 * 60 * 1000
+
+// What the commit buttons ask Claude to do. Other chats may share the
+// working tree, so a commit takes this task's files alone.
+const COMMIT_PROMPT =
+  'Закоммить изменения этой задачи: посмотри git status и git diff, возьми только файлы, ' +
+  'которые относятся к этой задаче (в рабочей копии могут быть изменения других чатов — их не ' +
+  'трогай), и сделай коммит по правилам этого репозитория.'
+const GIT_PROMPTS = {
+  commit: `${COMMIT_PROMPT} Не пушь.`,
+  'commit-push': `${COMMIT_PROMPT} Затем запушь текущую ветку.`,
+  push: 'Запушь текущую ветку. Незакоммиченные изменения не трогай.',
+} as const
 
 type Step = { model: string; effort: string | null }
 type Run = { status: string; conclusion: string; workflowName: string; url: string }
@@ -426,6 +444,23 @@ async function followId($: EngineInterface): Promise<void> {
   asking.clear()
 }
 
+// A press on one of the commit offer's buttons: a prompt of the person's
+// own, or «Подождать», which hides the offer for this commit for a while.
+async function answerGitOffer(
+  $: EngineInterface,
+  choice: keyof typeof GIT_PROMPTS | 'wait',
+): Promise<void> {
+  const sha = me.git?.sha ?? ''
+  const until = (await $.clock.now()) + POSTPONE_MS
+  await update($, gitOfferPostponed, () => `${sha}|${until}`)
+  if (choice !== 'wait') await $.prompt.submit({ text: GIT_PROMPTS[choice] })
+}
+
+function isOfferPostponed(postponed: string, git: GitStatus, now: number): boolean {
+  const [sha, until] = postponed.split('|')
+  return sha === git.sha && now < Number(until)
+}
+
 function keyOf(record: SessionRecord): string {
   return record.git?.repo ?? record.cwd
 }
@@ -589,15 +624,55 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
 
+    const git = record.git
+    const dirty = git?.dirty ?? 0
+    const ahead = git?.ahead ?? 0
+    // Offered between turns only: mid-turn the work is not done yet.
+    const isOffered =
+      git !== null &&
+      (dirty > 0 || ahead > 0) &&
+      record.activity === 'idle' &&
+      !isOfferPostponed(await read($, gitOfferPostponed), git, now)
+    const pending = [
+      dirty > 0 ? `не закоммичено файлов: ${dirty}` : '',
+      ahead > 0 ? `не запушено коммитов: ${ahead}` : '',
+    ].filter(part => part !== '')
+
     return (
-      <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-        {activityText(Text, record, now)}
-        <Text dimColor>·</Text>
-        {modelText(Text, record)}
-        {agentsText(Text, record)}
-        {record.git !== null && <Text dimColor>·</Text>}
-        {record.git !== null && gitText(Text, record.git)}
-        <Button key="open" plain label="Сессии проекта" onPress={() => fire(openPane($))} />
+      <Box flexDirection="column" rowGap={1}>
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+          {activityText(Text, record, now)}
+          <Text dimColor>·</Text>
+          {modelText(Text, record)}
+          {agentsText(Text, record)}
+          {git !== null && <Text dimColor>·</Text>}
+          {git !== null && gitText(Text, git)}
+          <Button key="open" plain label="Сессии проекта" onPress={() => fire(openPane($))} />
+        </Box>
+        {isOffered && (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="center">
+            <Text color="warning">{`✎ ${pending.join(' · ')}`}</Text>
+            {dirty > 0 && (
+              <Button
+                key="commit"
+                variant="primary"
+                label="Закоммитить"
+                onPress={() => fire(answerGitOffer($, 'commit'))}
+              />
+            )}
+            {dirty > 0 && (
+              <Button
+                key="commit-push"
+                label="Закоммитить и запушить"
+                onPress={() => fire(answerGitOffer($, 'commit-push'))}
+              />
+            )}
+            {ahead > 0 && (
+              <Button key="push" label="Запушить" onPress={() => fire(answerGitOffer($, 'push'))} />
+            )}
+            <Button key="wait" label="Подождать" onPress={() => fire(answerGitOffer($, 'wait'))} />
+          </Box>
+        )}
       </Box>
     )
   })
