@@ -37,6 +37,9 @@ type Step = { model: string; effort: string | null }
 type Run = { status: string; conclusion: string; workflowName: string; url: string }
 
 const ACTIVE_AGENT = new Set(['pending', 'running', 'waiting'])
+// Tools that change the working tree: git is looked at again shortly after.
+const WRITING_TOOL = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash'])
+const GIT_SETTLE_MS = 10_000
 const FAILED_RUN = new Set(['failure', 'cancelled', 'timed_out', 'startup_failure'])
 
 // This process's view of its own session; every session's record lives in a
@@ -60,6 +63,9 @@ const me = {
   isTitleOff: false,
   // No app tools here: a terminal session.
   isAppless: false,
+  // The app's id of this chat (local_…), which opens it from outside.
+  appId: '',
+  isGitQueued: false,
 }
 const agentSteps = new Map<string, Step>()
 // Tool calls whose permission prompt is open, by tool_use_id.
@@ -229,6 +235,8 @@ async function refreshGit($: EngineInterface): Promise<void> {
     const branch = (await run($, ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], at)) ?? '?'
     const upstream = await run($, ['git', 'rev-parse', '@{u}'], at)
     const ahead = Number((await run($, ['git', 'rev-list', '--count', '@{u}..HEAD'], at)) ?? 0)
+    const changes = await run($, ['git', 'status', '--porcelain'], at)
+    const dirty = changes === null || changes === '' ? 0 : changes.split('\n').length
     const slug = parseRepo(repo.remote)
     const git: GitStatus = {
       repo: slug,
@@ -238,6 +246,7 @@ async function refreshGit($: EngineInterface): Promise<void> {
       subject,
       when,
       ahead,
+      dirty,
       ci: 'unknown',
       ciName: '',
       ciUrl: null,
@@ -323,7 +332,7 @@ async function readApp(
   if (!(await isAllowed($, INFO_TOOL))) return null
   const info = await $.tool.call({ tool: INFO_TOOL, session_id: 'self' }).catch(() => null)
   if (info === null || info.deny !== undefined || info.isError === true) return null
-  let found: { title?: unknown; model?: unknown; effort?: unknown }
+  let found: { sessionId?: unknown; title?: unknown; model?: unknown; effort?: unknown }
   try {
     found = JSON.parse(info.text ?? '{}') as typeof found
   } catch {
@@ -336,6 +345,7 @@ async function readApp(
   }
   const base = app.title.replace(MARK, '').trim()
   if (base !== '') me.title = base.slice(0, 80)
+  if (typeof found.sessionId === 'string') me.appId = found.sessionId
   // While a turn runs, its own steps say what the model really got.
   if (me.activity !== 'working') {
     if (app.model !== '') me.model = app.model
@@ -380,6 +390,7 @@ async function writeRecord($: EngineInterface): Promise<void> {
   const list = await agents($)
   const record: SessionRecord = {
     id: me.id,
+    appId: me.appId,
     title: me.title,
     cwd: me.cwd,
     project: (me.git?.repo ?? me.cwd).split('/').pop() ?? me.cwd,
@@ -525,6 +536,13 @@ export const register: Register = on => {
     try {
       return await next(e)
     } finally {
+      if (WRITING_TOOL.has(String(e.tool)) && !me.isGitQueued) {
+        me.isGitQueued = true
+        $.clock.after(GIT_SETTLE_MS, () => {
+          me.isGitQueued = false
+          fire(refreshAll($))
+        })
+      }
       if (asking.delete(e.tool_use_id) && asking.size === 0 && me.activity === 'waiting') {
         me.activity = 'working'
         fire(publish($))
@@ -719,6 +737,7 @@ const CI_MARK: Record<CiState, { mark: string; color: string; label: string }> =
 
 function gitText(Text: TextCtor, git: GitStatus) {
   const ci = CI_MARK[git.ci]
+  const dirty = (git.dirty ?? 0) > 0 ? ` · не закоммичено: ${git.dirty}` : ''
   const unpushed = git.ahead > 0 ? ` · не запушено: ${git.ahead}` : ''
   const ciName = git.ciName !== '' && git.ci !== 'none' ? ` (${git.ciName})` : ''
   // With unpushed commits the build shown is the upstream's, not HEAD's.
@@ -726,7 +745,7 @@ function gitText(Text: TextCtor, git: GitStatus) {
   return (
     <Text wrap="truncate-end">
       <Text dimColor>
-        {`${git.branch} ${git.short} «${git.subject.slice(0, 50)}» ${git.when}${unpushed} `}
+        {`${git.branch} ${git.short} «${git.subject.slice(0, 50)}» ${git.when}${dirty}${unpushed} `}
       </Text>
       <Text color={ci.color}>{`${ci.mark} ${ci.label}${ciOf}${ciName}`}</Text>
       {git.error !== undefined ? <Text color="warning">{` · ${git.error}`}</Text> : null}

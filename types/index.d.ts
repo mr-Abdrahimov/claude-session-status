@@ -10,6 +10,8 @@ export type GitStatus = {
   subject: string
   when: string
   ahead: number
+  // Files changed and not committed; absent in records of 0.2 and older.
+  dirty?: number
   ci: CiState
   ciName: string
   ciUrl: string | null
@@ -29,6 +31,8 @@ export type AgentRow = {
 
 export type SessionRecord = {
   id: string
+  // The desktop app's id of the chat (local_…); empty outside the app.
+  appId?: string
   title: string
   cwd: string
   project: string
