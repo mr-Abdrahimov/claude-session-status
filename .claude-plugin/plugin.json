@@ -1,0 +1,8 @@
+{
+  "name": "session-status",
+  "version": "0.1.0",
+  "description": "Статус чатов: идёт ли работа, сколько агентов, модель и effort, последний коммит и его сборка на GitHub",
+  "author": { "name": "mr-Abdrahimov" },
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
